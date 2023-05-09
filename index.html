@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC - test</title>
+</head>
+
+<body>
+    <div style="display: flex;">
+        <div id="box" style="width: 50%; height: 600px; background: darkgrey; overflow-y: scroll;"></div>
+        <div style="width: 50%;">
+            <input id="input" />
+            <input type="file" id="fileInput" />
+            <button onclick="sendTextMessageClick()">发送消息</button>
+            <button onclick="sendVideoClick()">视频通话</button>
+            <button onclick="sendFileClick()">发送文件</button>
+            <video id="this" autoplay playsinline muted></video>
+            <video id="receiver" autoplay playsinline muted></video>
+        </div>
+    </div>
+    <script>
+        const ICE_SERVER_CONFIG = {}; // your ice server config.
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const senderId = urlParams.get('uid');
+        const receiverId = senderId === 'user1' ? 'user2' : 'user1';
+        let fileChunks = [];
+        let preFileLoadProgress = 0;
+        let p2pConnection = null;
+        let p2pDataChannel = null;
+
+        class Utils {
+            static ab2str(buf) {
+                return String.fromCharCode.apply(null, new Uint16Array(buf));
+            }
+
+            static str2ab(str) {
+                const buf = new ArrayBuffer(str.length * 2);
+                const bufView = new Uint16Array(buf);
+
+                for (let i = 0, strLen = str.length; i < strLen; i++) {
+                    bufView[i] = str.charCodeAt(i);
+                }
+                return buf;
+            }
+        }
+
+        class Message {
+            static CONTENT_TYPE_TEXT = 1;
+            static CONTENT_TYPE_FILE = 2;
+            static CONTENT_TYPE_OFFER = 3;
+            static CONTENT_TYPE_ICE_CANDIDATE = 4;
+            static CONTENT_TYPE_ANSWER = 5;
+
+            static PROCESS_TYPE_HEARTBEAT = 0;
+            static PROCESS_TYPE_COMMON = 1;
+
+            static generate(content = document.getElementById("input")?.value, contentType = Message.CONTENT_TYPE_TEXT, processType = Message.PROCESS_TYPE_COMMON) {
+                return JSON.stringify({
+                    id: Date.now(),
+                    senderId: senderId,
+                    receiverId: receiverId,
+                    content: JSON.stringify(content),
+                    extra: "",
+                    contentType,
+                    processType,
+                    resource: [],
+                });
+            }
+
+            static dispatch(msg = '{}') {
+                const { CONTENT_TYPE_TEXT, CONTENT_TYPE_FILE, CONTENT_TYPE_OFFER, CONTENT_TYPE_ICE_CANDIDATE, CONTENT_TYPE_ANSWER } = Message;
+                const { onText, onFile, onOffer, onICECandidate, onAnswer } = Message;
+
+                msg = JSON.parse(msg);
+                msg.content = msg.content && JSON.parse(msg.content);
+                switch (msg.contentType) {
+                    case CONTENT_TYPE_TEXT:
+                        onText(msg);
+                        break;
+                    case CONTENT_TYPE_FILE:
+                        onFile(msg);
+                        break;
+                    case CONTENT_TYPE_OFFER:
+                        onOffer(msg);
+                        break;
+                    case CONTENT_TYPE_ICE_CANDIDATE:
+                        onICECandidate(msg);
+                        break;
+                    case CONTENT_TYPE_ANSWER:
+                        onAnswer(msg);
+                        break;
+                }
+            }
+
+            static onText({ content }) {
+                document.getElementById("box").innerHTML += content;
+            }
+
+            static onFile({ content }) {
+                const { state, fileName, progress, chunk } = content;
+                const { STATE_TYPE_START, STATE_TYPE_READING, STATE_TYPE_DONE } = FileChunkReader;
+
+                switch(state) {
+                    case STATE_TYPE_START:
+                        fileChunks.push(Utils.str2ab(chunk));
+                        Message.onText({ content: `<div>对方给你传输了一个文件: ${fileName}</div>` });
+                        break;
+                    case STATE_TYPE_READING:
+                        fileChunks.push(Utils.str2ab(chunk));
+                        if (preFileLoadProgress + 10 <= progress) {
+                            Message.onText({ content: `<div>正在传输${fileName}, 进度: ${progress}%...</div>` });
+                            preFileLoadProgress = progress;
+                        }
+                        break;
+                    case STATE_TYPE_DONE:
+                        Message.onText({ content: `<div>${fileName}传输完成, <a href="${URL.createObjectURL(new Blob(fileChunks))}" download="${fileName}">点击下载</a></div>` });
+                        break;
+                }
+            }
+
+            static async onICECandidate({ content }) {
+                await p2pConnection.addIceCandidate(new RTCIceCandidate(content)).catch(reportError);
+            }
+
+            static async onOffer({ content }) {
+                createP2pConnection();
+                await createAndBindStream(void 0, false);
+
+                await p2pConnection.setRemoteDescription(new RTCSessionDescription(content));
+                await p2pConnection.setLocalDescription(await p2pConnection.createAnswer());
+
+                wsClient.sendMessage(Message.generate(p2pConnection.localDescription, Message.CONTENT_TYPE_ANSWER));
+            }
+
+            static async onAnswer({ content }) {
+                await p2pConnection.setRemoteDescription(new RTCSessionDescription(content)).catch(reportError);
+            }
+        }
+
+        class WebsocketClient {
+            static SOCKET_URI = ''; // your socket uri.
+
+            static create(...args) {
+                if (!WebsocketClient.instance) WebsocketClient.instance = new WebsocketClient(...args);
+                return WebsocketClient.instance;
+            }
+
+            _client = null;
+            _listeners = new Map();
+
+            constructor() {
+                const client = new WebSocket(`${WebsocketClient.SOCKET_URI}/${senderId}`);
+                let closeHeartbeat = null;
+
+                client.addEventListener("open", () => {
+                    console.info(`ws:用户${senderId}开启websocket`);
+
+                    this._call("open");
+                    closeHeartbeat = this._initHeartbeat();
+                });
+
+                client.addEventListener("message", (event) => {
+                    this._call("message", event?.data);
+                });
+
+                client.addEventListener("error", (error) => {
+                    console.error(`ws:用户${senderId}连接websocket发生错误: ${JSON.stringify(error)}`);
+
+                    this._call("error", error);
+                    closeHeartbeat?.();
+                });
+
+                client.addEventListener("close", async () => {
+                    console.info(`ws:用户${senderId}websocket连接断开`);
+
+                    this._call("close");
+                    closeHeartbeat?.();
+                });
+
+                this._client = client;
+            }
+
+            _initHeartbeat() {
+                let timer = setInterval(() => this.sendMessage(Message.generate("❤️", void 0, Message.PROCESS_TYPE_HEARTBEAT)), 1000 * 10);
+                return () => (clearInterval(timer), timer = null);
+            }
+
+            _call(type, event) {
+                const listeners = this._listeners.get(type);
+                if (!listeners) return;
+
+                listeners.forEach(async (listener) => await listener(event));
+            }
+
+            on(type, listener) {
+                const listeners = this._listeners.get(type);
+                if (listeners) {
+                    listeners.add(listener);   
+                } else {
+                    this._listeners.set(type, new Set([listener]));
+                }
+            }
+
+            off(type, listener) {
+                const listeners = this.listenersMap.get(type);
+                if (listeners) listeners.delete(listener);
+            }
+
+            sendMessage(msg = Message.generate()) {
+                this._client?.send(msg);
+            }
+        }
+
+        class FileChunkReader {
+            static BYTES_PER_CHUNK = 1200;
+            static STATE_TYPE_START = 'start';
+            static STATE_TYPE_READING = 'reading';
+            static STATE_TYPE_DONE = 'done';
+
+            static create(...args) {
+                if (!FileChunkReader.instance) FileChunkReader.instance = new FileChunkReader(...args);
+                return FileChunkReader.instance;
+            }
+
+            _file = null;
+            _chunkIndex = 0;
+            _fileReader = null;
+            _listeners = new Map();
+
+            constructor(createFileReader = () => new FileReader(), handleChunk = (chunk) => Utils.ab2str(chunk)) {
+                const fileReader = createFileReader();
+
+                fileReader.onload = () => {
+                    const { BYTES_PER_CHUNK, STATE_TYPE_START, STATE_TYPE_READING, STATE_TYPE_DONE } = FileChunkReader;
+                    const readSize = BYTES_PER_CHUNK * this._chunkIndex;
+                    const done = readSize > this._file?.size;
+                    const state = this._chunkIndex === 0 ? STATE_TYPE_START : (done ? STATE_TYPE_DONE : STATE_TYPE_READING);
+                    const progress = Number(((readSize / this._file.size ) * 100).toFixed(2));
+
+                    this._call('load', {
+                        fileName: this._file.name,
+                        fileSize: this._file.size,
+                        chunkIndex: this._chunkIndex,
+                        chunk: handleChunk ? handleChunk(fileReader.result) : fileReader.result,
+                        state,
+                        progress,
+                    });
+
+                    this._chunkIndex++;
+
+                    if (done) {
+                        this._file = null;
+                        this._chunkIndex = 0;
+                    } else {
+                        this._readNextChunk();
+                    }
+                }
+
+                this._fileReader = fileReader;
+            }
+
+            _call(type, event) {
+                const listeners = this._listeners.get(type);
+                if (!listeners) return;
+
+                listeners.forEach(async (listener) => await listener(event));
+            }
+
+            _readNextChunk() {
+                const start = FileChunkReader.BYTES_PER_CHUNK * this._chunkIndex;
+                const end = Math.min(this._file.size, start + FileChunkReader.BYTES_PER_CHUNK);
+                this._fileReader.readAsArrayBuffer(this._file.slice( start, end ));
+            }
+
+            _on(type, listener) {
+                const listeners = this._listeners.get(type);
+                if (listeners) {
+                    listeners.add(listener);   
+                } else {
+                    this._listeners.set(type, new Set([listener]));
+                }
+            }
+
+            read(file, cb) {
+                this._file = file;
+                this._chunkIndex = 0;
+                this._on('load', cb);
+                this._readNextChunk();
+            }
+        }
+
+        function createP2pConnection() {
+            if (p2pConnection) return;
+
+            p2pConnection = new RTCPeerConnection();
+            p2pConnection.setConfiguration(ICE_SERVER_CONFIG);
+            p2pConnection.onicecandidate = ({ candidate } = {}) => candidate && wsClient.sendMessage(Message.generate(candidate, Message.CONTENT_TYPE_ICE_CANDIDATE));
+            p2pConnection.ontrack = ({ streams } = {}) => document.getElementById("receiver").srcObject = streams[0];
+
+            p2pConnection.createDataChannel('fileTransfer', { ordered: true }).onmessage = ({ data }) => Message.dispatch(data);
+
+            p2pConnection.ondatachannel = (event) => {
+                p2pDataChannel = event.channel;
+                p2pDataChannel.onmessage = ({ data }) => Message.dispatch(data);
+            };
+        }
+
+        // const defaultCreateStream = async () => await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const defaultCreateStream = async () => await navigator.mediaDevices.getDisplayMedia({ video: true });
+        async function createAndBindStream(createStream = defaultCreateStream, isSender = true) {
+            const stream = await createStream();
+
+            document.getElementById("this").srcObject = stream;
+            stream.getTracks().forEach((track) => p2pConnection.addTrack(track, stream));
+
+            if (!isSender) return;
+
+            await p2pConnection.setLocalDescription(await p2pConnection.createOffer());
+            wsClient.sendMessage(Message.generate(p2pConnection.localDescription, Message.CONTENT_TYPE_OFFER));
+        }
+
+        // 发送消息
+        function sendTextMessageClick() {
+            wsClient.sendMessage();
+        }
+
+        // 视频通话
+        function sendVideoClick() {
+            createP2pConnection();
+            createAndBindStream();
+        }
+
+        // 发送文件
+        function sendFileClick() {
+            const { files = [] } = document.getElementById("fileInput") || {};
+            if (!files.length) return alert('请先选择文件！');
+
+            fileChunkReader.read(files[0], (data) => {
+                p2pDataChannel.send(Message.generate(data, Message.CONTENT_TYPE_FILE));
+            });
+        }
+    
+        const wsClient = WebsocketClient.create();
+        const fileChunkReader = FileChunkReader.create();
+        wsClient.on('message', Message.dispatch);
+    </script>
+</body>
+
+</html>
